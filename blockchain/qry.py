@@ -102,6 +102,17 @@ def format_verification_record(verification_record):
     }
 
 
+def format_pending_transaction(pending_timestamp_record):
+    return {
+        "timestamp_id":         pending_timestamp_record["timestamp_id"],
+        "block_id":             pending_timestamp_record["block_id"],
+        "origin_id":            pending_timestamp_record["origin_id"],
+        "create_ts":            pending_timestamp_record["create_ts"],
+        "signature":            pending_timestamp_record["signature"],
+        "verification_info":    pending_timestamp_record["verification_info"]
+    }
+
+
 def format_subscription(subscription):
     """ format and return given subscription into dictionary """
     return {
@@ -144,4 +155,19 @@ def format_backlog(backlog):
         "transfer_id":  backlog["transfer_id"],
         "client_id":    backlog["client_id"],
         "block_id":     backlog["block_id"]
+    }
+
+
+def format_sc(sc):
+    """ format and return given smart contract into dictionary """
+    return {
+        "sc_id":            sc["sc_id"],
+        "sc_class":         sc["sc_class"],
+        "smart_contract":   sc["smart_contract"],
+        "sc_key":           sc["sc_key"],
+        "criteria":         sc["criteria"],
+        "test":             sc["test"],
+        "requirements":     sc["requirements"],
+        "version":          sc["version"],
+        "status":           sc["status"]
     }

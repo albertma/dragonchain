@@ -22,6 +22,18 @@ KIND, either express or implied. See the Apache License for the specific
 language governing permissions and limitations under the Apache License.
 """
 
+"""
+                ***** server-side subscription dao ******
+Stores subscription info from subscribers (client nodes) for the data provider.
+data stored:
+ - node id of subscriber (client)
+ - criteria to be met by subscription
+ - phase criteria to be met by subscription
+ - public key of subscriber (client)
+ - subscription create timestamp
+subscription data is queried based on subscriber ids and phase criteria.
+"""
+
 __author__ = "Joe Roets, Brandon Kite, Dylan Yelton, Michael Bachtel"
 __copyright__ = "Copyright 2016, Disney Connected and Advanced Technologies"
 __license__ = "Apache"
@@ -43,7 +55,7 @@ import uuid
 DEFAULT_PAGE_SIZE = 1000
 """ SQL Queries """
 SQL_GET_BY_ID = """SELECT * FROM sub_from WHERE subscriber_id = %s"""
-SQL_GET_ALL = """SELECT * FROM sub_from"""
+SQL_GET_ALL_BY_PHASE = """SELECT * FROM sub_from WHERE phase_criteria = %s"""
 SQL_INSERT = """INSERT into sub_from (
                     subscriber_id,
                     criteria,
@@ -83,7 +95,7 @@ def get(subscriber_id):
     conn = get_connection_pool().getconn()
     try:
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-        cur.execute(SQL_GET_BY_ID, (subscriber_id,))
+        cur.execute(SQL_GET_BY_ID, (subscriber_id, ))
         result = cur.fetchone()
         cur.close()
         if result:
@@ -95,15 +107,11 @@ def get(subscriber_id):
 
 def get_by_phase_criteria(phase):
     """ retrieve subscriptions with phase criteria that match given phase """
-    query = SQL_GET_ALL
-    query += """ WHERE phase_criteria = """ + str(phase)
-
     subscriptions = []
-
     conn = get_connection_pool().getconn()
     try:
         cur = conn.cursor(get_cursor_name(), cursor_factory=psycopg2.extras.DictCursor)
-        cur.execute(query)
+        cur.execute(SQL_GET_ALL_BY_PHASE, (phase, ))
         'An iterator that uses fetchmany to keep memory usage down'
         while True:
             results = cur.fetchmany(DEFAULT_PAGE_SIZE)

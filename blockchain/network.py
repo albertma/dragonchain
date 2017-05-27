@@ -44,6 +44,7 @@ from apscheduler.triggers.cron import CronTrigger
 from blockchain.db.postgres import network_db as net_dao
 from blockchain.db.postgres import vr_transfers_db
 from blockchain.db.postgres import verification_db
+
 from blockchain.db.postgres import sub_to_db
 from blockchain.db.postgres import sub_from_db
 from blockchain.db.postgres import transaction_db
@@ -55,6 +56,7 @@ import gen.messaging.ttypes as message_types
 import db.postgres.postgres as pg
 
 from blockchain.util import thrift_conversions as thrift_converter
+
 from blockchain.util.crypto import validate_subscription
 
 from thrift import Thrift
@@ -77,6 +79,8 @@ OWNER_PROPERTY_KEY = 'owner'
 BUSINESS_PROPERTY_KEY = 'business'
 LOCATION_PROPERTY_KEY = 'deploy_location'
 PUB_TRANS_PROPERTY_KEY = 'public_transmission'
+VR_DB_LIMIT = 'vr_db_limit'
+TXN_DB_LIMIT = 'txn_db_limit'
 INBOUND_TIMEOUT = 30  # seconds
 
 RECORD = 'record'
@@ -142,6 +146,8 @@ class ConnectionManager(object):
         self.port = port
         self.business = None
         self.deploy_location = None
+        self.vr_db_limit = None
+        self.txn_db_limit = None
         # phase_type => {nodes} (dictionary of connected nodes)
         self.peer_dict = {}
         self.config = None
@@ -174,6 +180,12 @@ class ConnectionManager(object):
         self.business = self.config[BUSINESS_PROPERTY_KEY]
         self.deploy_location = self.config[LOCATION_PROPERTY_KEY]
 
+        if VR_DB_LIMIT in self.config:
+            self.vr_db_limit = self.config[VR_DB_LIMIT]
+
+        if TXN_DB_LIMIT in self.config:
+            self.txn_db_limit = self.config[TXN_DB_LIMIT]
+
         # set public_transmission dictionary from yml config
         if self.processing_node:
             self.processing_node.public_transmission = self.config[PUB_TRANS_PROPERTY_KEY]
@@ -204,8 +216,13 @@ class ConnectionManager(object):
         scheduler.add_job(self.refresh_registered, CronTrigger(second='*/5'))
         scheduler.add_job(self.refresh_unregistered, CronTrigger(second='*/60'))
         scheduler.add_job(self.connect, CronTrigger(second='*/5'))
-        scheduler.add_job(self.timed_receipt_request, CronTrigger(second='*/300'))
         scheduler.add_job(self.subscription_feed, CronTrigger(second='*/5'))
+
+        # the timed_receipt_request only is added to the chron for nodes that are transmitting up the chain.
+        if (self.this_node.phases & 0b00111 or
+           (self.this_node.phases & 0b01000 and self.config['public_transmission']['p4_pub_trans'])):
+            scheduler.add_job(self.timed_receipt_request, CronTrigger(second='*/300'))
+
         scheduler.start()
 
     def refresh_registered(self):
@@ -438,6 +455,7 @@ class ConnectionManager(object):
                 message = template.format(type(ex).__name__, ex.args)
                 logger().warning(message)
 
+
     def phase_2_broadcast(self, block_info, phase_type):
         """ sends phase_2 information for phase_3 execution """
         phase_2_msg = thrift_converter.get_p2_message(block_info)
@@ -466,10 +484,25 @@ class ConnectionManager(object):
                 logger().warning('failed to submit to node %s', node.node_id)
                 continue
 
-    # TODO: implement this broadcast
-    # TODO: make sure to add in vrs = self.get_vrs(node, ver_ids) self.resolve_data(vrs, 4)
     def phase_4_broadcast(self, block_info, phase_type):
-        pass
+        """ send phase_4 information for phase_5 execution """
+        ver_ids = []
+
+        verification_record = block_info['verification_record']
+        verification_info = verification_record['verification_info']
+
+        phase_4_msg = message_types.Phase_4_msg()
+        phase_4_msg.record = thrift_converter.convert_to_thrift_record(verification_record)
+        phase_4_msg.lower_hash = verification_info
+
+        for node in self.peer_dict[phase_type]:
+            try:
+                ver_ids += node.client.phase_4_message(phase_4_msg)
+                vrs = self.get_vrs(node, ver_ids)
+                self.resolve_data(vrs, 4)
+            except:
+                logger().warning('failed to submit to node %s', node.node_id)
+                continue
 
     def timed_receipt_request(self):
         """ time based receipt request """
@@ -493,8 +526,14 @@ class ConnectionManager(object):
                 # subscription already approved, request data from server
                 if subscription['status'] == "approved":
                     subscription_response = subscription_node.client.subscription_request(subscription_id, subscription_signature)
-                    self.insert_transactions(map(thrift_converter.convert_thrift_transaction, subscription_response.transactions))
-                    self.insert_verifications(map(thrift_converter.convert_thrift_verification, subscription_response.verification_records))
+                    txns = map(thrift_converter.convert_thrift_transaction, subscription_response.transactions)
+                    vrs = map(thrift_converter.convert_thrift_verification, subscription_response.verification_records)
+                    self.insert_transactions(txns)
+                    self.insert_verifications(vrs)
+                    if txns or vrs:
+                        min_block_id = self.get_min_block_id(vrs)
+                        # execute any present subscription smart contracts
+                        self.processing_node.sch.execute_ssc(min_block_id, self.vr_db_limit, self.txn_db_limit)
                 elif subscription['status'] == "pending":
                     logger().warning("Subscription[sub_id:%s][node_id:%s][node_owner:%s] still in pending status... Waiting for admin(s) approval.",
                                      subscription['subscription_id'], subscription['subscribed_node_id'], subscription['node_owner'])
@@ -556,12 +595,18 @@ class ConnectionManager(object):
                 logger().error(message)
                 continue
 
+    def get_min_block_id(self, vrs):
+        """ return minimum block id of given verification records """
+        return min(v['block_id'] for v in vrs)
+
     def resolve_data(self, verifications, phase):
         """ store received verifications from node, find replications and store them in transfers table """
         for verification in verifications:
             try:
                 verification = thrift_converter.convert_thrift_verification(verification)
                 if verification['signature']['signatory'] is not self.this_node.node_id:
+                    # run broadcast smart contract (BSC)
+                    self.processing_node.sch.execute_bsc(phase, verification)
                     verification_db.insert_verification(verification, verification['verification_id'])
                     # check if there are nodes further down the chain interested in this record
                     replicated_verifications = verification_db.get_all_replication(verification['block_id'], phase, verification['origin_id'])
@@ -645,7 +690,7 @@ class ConnectionManager(object):
 
             phase_msg = None
             verification_record = message_types.VerificationRecord()
-            phase_5_msg = message_types.Phase_5_msg()
+            phase_5_request = message_types.Phase_5_request()
 
             if phase == 1:
                 phase_msg = thrift_converter.get_p1_message(block_info)
@@ -657,15 +702,16 @@ class ConnectionManager(object):
                 phase_msg = thrift_converter.get_p3_message(block_info)
                 verification_record.p3 = phase_msg
             elif phase == 4:
-                pass
+                phase_msg = thrift_converter.get_p4_message(block_info)
+                verification_record.p4 = phase_msg
 
-            phase_5_msg.verification_record = verification_record
+            phase_5_request.verification_record = verification_record
 
             # send block to all known phase 5 nodes
             if phase_msg:
                 for node in self.peer_dict[PHASE_5_NODE]:
                     try:
-                        node.client.phase_5_message(phase_5_msg)
+                        node.client.phase_5_message(phase_5_request)
                         logger().info('block sent for public transmission...')
                     except:
                         logger().warning('failed to submit to node %s', node.node_id)
@@ -771,9 +817,10 @@ class BlockchainServiceHandler:
         elif phase_5.verification_record.p3:
             phase_info = thrift_converter.get_phase_3_info(phase_5.verification_record.p3)
         elif phase_5.verification_record.p4:
-            pass
+            phase_info = thrift_converter.get_phase_4_info(phase_5.verification_record.p4)
 
-        self.connection_manager.processing_node.notify(5, phase_5_info=phase_info)
+        self.connection_manager.processing_node.notify(5, verification=phase_info)
+
         return []
 
     def get_peers(self):
